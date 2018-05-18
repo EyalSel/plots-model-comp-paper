@@ -108,7 +108,7 @@ class NodeConfig(object):
 
 class NodeProfile(object):
 
-    def __init__(self, name, profile, throughput_stage, utilization, latency_perc=1.0):
+    def __init__(self, name, profile, throughput_stage, utilization=1.0, latency_perc=1.0):
         """
         Parameters:
         -----------
@@ -299,7 +299,7 @@ class NodeProfile(object):
             & (self.profile.cloud == config.cloud)]
         resource_bundle_matches = resource_bundle_matches.sort_values("mean_batch_size")
         if len(resource_bundle_matches) == 0:
-            logger.error("No profiles for node under provided configuration: {}".format(
+            print("No profiles for node under provided configuration: {}".format(
                 config))
             return None
             # raise Exception("No profiles for node under provided configuration: {}".format(
@@ -441,14 +441,33 @@ def get_logical_pipeline(pipeline_name):
 
     # Resnet Cascade
     elif pipeline_name == "pipeline_three":
+        # adj_list = {
+        #     LogicalDAG.SOURCE: ["cascadepreprocess", ],
+        #     "cascadepreprocess": ["alexnet"],
+        #     "alexnet": ["res50", LogicalDAG.SINK],
+        #     "res50": ["res152", LogicalDAG.SINK],
+        #     "res152": [LogicalDAG.SINK],
+        #     LogicalDAG.SINK: []
+        # }
         adj_list = {
-            LogicalDAG.SOURCE: ["alexnet", ],
-            "alexnet": ["res50", LogicalDAG.SINK],
-            "res50": ["res152", LogicalDAG.SINK],
+            LogicalDAG.SOURCE: ["cascadepreprocess", ],
+            "cascadepreprocess": ["alexnet"],
+            "alexnet": [LogicalDAG.SINK],
+            LogicalDAG.SINK: []
+        }
+        return LogicalDAG(adj_list, "cascadepreprocess")
+
+    elif pipeline_name == "conditional_cascade":
+        adj_list = {
+            LogicalDAG.SOURCE: ["cascadepreprocess", ],
+            "cascadepreprocess": ["alexnet"],
+            # "alexnet": ["res50", LogicalDAG.SINK],
+            # "res50": ["res152", LogicalDAG.SINK],
+            "alexnet": ["res152", LogicalDAG.SINK],
             "res152": [LogicalDAG.SINK],
             LogicalDAG.SINK: []
         }
-        return LogicalDAG(adj_list, "alexnet")
+        return LogicalDAG(adj_list, "cascadepreprocess")
 
 
 def get_node_scale_factors(exp, reference_node):

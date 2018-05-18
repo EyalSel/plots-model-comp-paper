@@ -6,12 +6,12 @@ import logging
 from multiprocessing import Process, Queue
 
 
-# logging.basicConfig(
-#     format='%(asctime)s %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s',
-#     datefmt='%y-%m-%d:%H:%M:%S',
-#     level=logging.INFO)
-
+logging.basicConfig(format='[%(filename)s:%(lineno)d] %(message)s',
+    datefmt='%d-%m-%Y:%H:%M:%S',
+    level=logging.DEBUG)
 logger = logging.getLogger(__name__)
+
+
 # logger.setLevel(logging.WARN)
 
 
@@ -149,22 +149,6 @@ class ArrivalHistory(object):
 
     def get_max_Q_and_time(self, latency, throughput):
 
-        """
-        Given a service curve whose service time is defined by the latency parameter
-        and service throughput defined by the throughput parameter, this function computes
-        two values.
-
-        + First, it computes the maximum horizontal distance between the service curve and the arrival curve.
-          (In units of time. For the current implementation, time is always measured in milliseconds). If the provided
-          latency includes the service time, this value is the maximum response time. If the provided latency does not
-          include the service time, this value is the maximum queue waiting time.
-
-        + Second, it computes the maximum vertical distance between the service curve and the arrival curve.
-          (In units of queries). This value should be ignored unless the provided latency includes the service time.
-          In the current implementation, we are ignoring it.
-
-        """
-
         max_x = self._get_max_x(latency, throughput)
         if max_x == np.inf:
             return (np.inf, np.inf)
@@ -196,14 +180,6 @@ class ArrivalHistory(object):
         return (self._max_Q_given_arrival(arrival_x, arrival_y, latency, throughput),
                 self._max_response_time_given_arrival(arrival_x, arrival_y, latency, throughput))
 
-    # def get_adjusted_max_Q_and_time(self, max_batch_size, service_time_func, throughput):
-    #     max_batch_service_time = service_time_func(max_batch_size)
-    #     max_effective_batch_size = min(self._get_arrival_curve_at_x(max_batch_service_time), max_batch_size)
-    #     # This is the service time of the maximum effective batch size
-    #     service_curve_horizontal_shift = service_time_func(max_effective_batch_size)
-    #     return self.get_max_Q_and_time(service_curve_horizontal_shift, throughput)
-
-
 class GreedyOptimizer(object):
 
     def __init__(self, dag, scale_factors, node_profs):
@@ -216,24 +192,20 @@ class GreedyOptimizer(object):
                               latency_constraint,
                               cost_constraint,
                               initial_config,
-                              arrival_history,
-                              # optimize_what="throughput",
-                              use_netcalc=True):
-        """
-        Parameters
-        ----------
-        optimize_what : str
-            Can be either "throughput" or "cost"
-        """
-
+                              arrival_history=None):
+        execution_history = {
+            "cur_pipeline_config":[],
+            "action": [],
+            "throughput": [],
+            "cost": []
+            
+        }
         arrival_history_obj = ArrivalHistory(arrival_history)
         cur_pipeline_config = initial_config
         if not profiler.is_valid_pipeline_config(cur_pipeline_config):
             logger.error("ERROR: provided invalid initial pipeline configuration")
         iteration = 0
         latency_slo_met = False
-        cur_estimated_perf, _ = profiler.estimate_pipeline_performance_for_config(
-            self.dag, self.scale_factors, cur_pipeline_config, self.node_profs)
         last_action_response_time = np.inf
         while True:
             def try_upgrade_gpu(bottleneck, pipeline_config):
@@ -265,25 +237,23 @@ class GreedyOptimizer(object):
             cur_bottleneck_config = cur_pipeline_config[cur_bottleneck_node]
             cur_bottleneck_node_lat, cur_bottleneck_node_thru, cur_bottleneck_node_cost = \
                 self.node_profs[cur_bottleneck_node].estimate_performance(cur_bottleneck_config)
-            cur_bottleneck_qpsd = cur_bottleneck_node_thru / cur_bottleneck_node_cost
 
-            actions = {"gpu": try_upgrade_gpu,
-                       "batch_size": try_increase_batch_size,
-                       "replication_factor": try_increase_replication_factor
-                       }
+            actions = {
+				"gpu": try_upgrade_gpu,
+                "batch_size": try_increase_batch_size,
+                "replication_factor": try_increase_replication_factor
+            }
 
             best_action = None
             best_action_thru = None
-            best_action_qpsd_delta = None
             best_action_config = None
             best_action_response_time = np.inf
 
             for action in actions:
+                logger.info("\n\nEvaluating step {}".format(action))
                 new_bottleneck_config = actions[action](cur_bottleneck_node, cur_pipeline_config)
-                # logger.info(new_bottleneck_config)
                 if new_bottleneck_config:
-                    logger.info("Evaluating step {}".format(action))
-                    logger.info("\nOld config: {}\nNew config: {}\n".format(
+                    logger.info("\tOld config: {}\nNew config: {}".format(
                         cur_pipeline_config[cur_bottleneck_node], new_bottleneck_config))
                     copied_pipeline_config = copy.deepcopy(cur_pipeline_config)
                     copied_pipeline_config[cur_bottleneck_node] = new_bottleneck_config
@@ -292,93 +262,33 @@ class GreedyOptimizer(object):
                     if result is None:
                         continue
                     new_estimated_perf, new_bottleneck_node = result
+                    logger.info("\tNew estimated perf: {}".format(new_estimated_perf))
                     # We'll never take this action if it violates the cost constraint
                     if new_estimated_perf["cost"] > cost_constraint:
+                        logger.info("Cost {} higher than constraint {}, skipping this action".format(new_estimated_perf["cost"], cost_constraint))
                         continue
-                    if use_netcalc:
-                        logger.info("Doing network calc")
-                        netcalc_config = new_bottleneck_config
+                    logger.info("\tDoing network calc")
+                    netcalc_config = new_bottleneck_config
+                    T_S = new_estimated_perf["latency"]
+                    _, Q_waiting_time = arrival_history_obj.get_max_Q_and_time(0, #T_S * 1000.0,
+                            new_estimated_perf["throughput"] / 1000.)
 
+                    # converting time to seconds
+                    T_Q = Q_waiting_time / 1000.0
+                    response_time = T_Q + T_S
+                    # assert T_Q >= T_S
 
-                        # DEFINING THE SERVICE CURVE FOR A NODE
-                        # -------------------------------------
-                        # The service curve for a node is defined by a throughput and latency. The throughput
-                        # is simply the throughput of that node under the given configuration. The latency
-                        # is composed of two components. First, we need to account for the service time of the
-                        # node under the given configuration (call this T_sb); this is the time spent actually processing
-                        # a batch. But, because we are doing batch processing (even with batch size of 1), we end up
-                        # with a departure flow that is stepwise. We therefore need to shift the service curve of the
-                        # node to be a lower bound on that stepwise function. In order to correct this, we need to account
-                        # for the maximum time that a query *that will be processed in the next batch* can spend in the queue.
-                        # Network calculus will account for variation in queuing time that arises from a bursty arrival
-                        # process, but does not account for the queuing delay induced by batching. This additional queuing
-                        # delay can be bounded by the service time for the node (imagine a query arrives in the queue just
-                        # as the previous batch is dispatched. It therefore must wait in the queue for the entire duration
-                        # of the previous batch (T_sb). Because of this, the latency describing the service curve of the
-                        # node is T_sb + T_sb. Note that because we are trying to estimate queue waiting time here and not
-                        # the response time, we perform network calculus on the service curve that defines the queue waiting
-                        # time, not the response time. Thus, the latency we provide is T_sb (without the multiplication by 2).
-                        #
-                        # Note that there is a potential optimization to account for situations where the arrival curve
-                        # will never result in a full size batch for a model (this frequently occurs when nodes are configured with
-                        # large batch sizes). In this case, using T_sb for the maximum amount of time that a query can wait
-                        # in the queue before being processed, because the node will never be processing a full size batch.
-                        # In this case, we can estimate the maximum effective batch size (T_se) for the given pipeline configuration
-                        # and arrival history, and use that instead.
-                        #
-                        # DEFINING THE SERVICE CURVE FOR THE PIPELINE
-                        # -------------------------------------------
-                        # Given service curves for all the nodes in the pipeline, deriving the aggregate service curve for the
-                        # pipeline is fairly straightforward:
-                        #
-                        # 1) Convolve the service curves of all the nodes along a given path by summing the latencies and
-                        #    taking a min over the throughputs. This is a convolution under the min-plus algebra.
-                        # 2) Aggregate the service curves of all the parallel paths by taking a max over the latencies
-                        #    and a min over the throughputs.
-                        #
-                        # Finally, we can do network calculus to estimate the maximum response time for the pipeline given
-                        # this aggregate service curve and the provided arrival curve.
-
-
-                        T_S = new_estimated_perf["latency"]
-                        _, Q_waiting_time = arrival_history_obj.get_max_Q_and_time(T_S * 1000.0,
-                                new_estimated_perf["throughput"] / 1000.)
-
-
-                        # def service_time_func(batch_size):
-                        #     netcalc_config.batch_size = batch_size
-                        #
-                        #     # Return the 0th element because we only need to
-                        #     # return the p99 latency (in ms)
-                        #     return self.node_profs[cur_bottleneck_node]\
-                        #             .estimate_performance(netcalc_config)[0] * 1000.0
-
-                        # _, Q_waiting_time = arrival_history_obj.get_adjusted_max_Q_and_time(
-                        #         new_bottleneck_config.batch_size,
-                        #         service_time_func,
-                        #         # Convert throughput to queries/ms
-                        #         new_estimated_perf["throughput"] / 1000.)
-
-                        # converting time to seconds
-                        T_Q = Q_waiting_time / 1000.0
-                        response_time = T_Q + T_S
-                        assert T_Q >= T_S
-
-                        logger.info("Response time: {total}, T_s={ts}, T_q={tq}".format(total=response_time,
-                            ts=T_S, tq=T_Q))
-                    else:
-                        T_Q = 0.0
-                        T_S = new_estimated_perf["latency"]
-                        # T_Q = T_S
-                        response_time = T_Q + T_S
+                    logger.info("\tResponse time: {total}, T_s={ts}, T_q={tq}".format(total=response_time,
+                        ts=T_S, tq=T_Q))
+                    
 
                     if latency_slo_met:
                         latency_to_compare = response_time
                     else:
                         latency_to_compare = T_S
                     if (latency_to_compare <= latency_constraint and
-                            new_estimated_perf["cost"] <= cost_constraint and
-                            2*T_S <= latency_constraint):
+                        new_estimated_perf["cost"] <= cost_constraint):
+                            # and 2*T_S <= latency_constraint):
                         if new_estimated_perf["throughput"] < cur_estimated_perf["throughput"]:
                             logger.warning(
                                 ("Uh oh: monotonicity violated:\n Old config: {}, Thru: {}"
@@ -388,26 +298,15 @@ class GreedyOptimizer(object):
                                      new_bottleneck_config,
                                      new_estimated_perf["throughput"]
                                  ))
-                        #############################################
-                        # QPSD CALCULATION
-                        # Estimate the latency, throughput, and cost for JUST the bottleneck node
-                        # in order to calculate QPSD
-                        action_bottleneck_node_lat, action_bottleneck_node_thru, action_bottleneck_node_cost = \
-                            self.node_profs[cur_bottleneck_node].estimate_performance(new_bottleneck_config)
-                        action_bottleneck_qpsd = action_bottleneck_node_thru / action_bottleneck_node_cost
-                        throughput_delta = new_estimated_perf["throughput"] - cur_estimated_perf["throughput"]
-                        qpsd_delta = action_bottleneck_qpsd - cur_bottleneck_qpsd
-                        logger.info("Node: {}, Action: {}, bottleneck qpsd delta: {}, bottleneck throughput delta: {}".format(
-                            cur_bottleneck_node, action, qpsd_delta, throughput_delta))
-                        ##############################################
                         if best_action is None or \
                                 best_action_thru < new_estimated_perf["throughput"]:
                             best_action = action
                             best_action_thru = new_estimated_perf["throughput"]
-                            best_action_qpsd_delta = qpsd_delta
                             best_action_config = new_bottleneck_config
                             best_action_response_time = response_time
-                            logger.info("Setting best action response time to {}".format(best_action_response_time))
+                            logger.info("\tSetting best action response time to {}".format(best_action_response_time))
+                else:
+                    logger.info("\tAction configuration returned as None")
 
             # No more steps can be taken
             if best_action is None:
@@ -416,10 +315,9 @@ class GreedyOptimizer(object):
             else:
                 cur_pipeline_config[cur_bottleneck_node] = best_action_config
                 logger.info(("Upgrading bottleneck node {bottleneck} to {new_config}."
-                    "\nIncreased QPSD by: {qpsd}.\nNew config: {new_conf}").format(
+                    "\nIncreased.\nNew config: {new_conf}").format(
                                  bottleneck=cur_bottleneck_node,
                                  new_config=best_action_config,
-                                 qpsd=best_action_qpsd_delta,
                                  new_conf=cur_pipeline_config))
                 # Once latency_slo_met is set to True, it should never be set to False again
                 if not latency_slo_met:
@@ -441,7 +339,7 @@ class GreedyOptimizer(object):
                 cur_estimated_perf["cost"] <= cost_constraint):
             return cur_pipeline_config, cur_estimated_perf, last_action_response_time
         else:
-            logger.error(("Error: No configurations found that satisfy application constraints.\n"
+            logger.info(("\n\nError: No configurations found that satisfy application constraints.\n"
                           "Latency constraint: {lat_const}, estimated response latency: {lat_est}\n"
                           "Cost constraint: {cost_const}, estimated cost: {cost_est}\nCURRENT CONFIG: {cur_config}").format(
                               lat_const=latency_constraint, lat_est=last_action_response_time,
