@@ -87,7 +87,9 @@ def instance_type(exp):
 
 def get_gpu_type(node_config):
     if "instance_type" in node_config:
-        if "p2" in node_config["instance_type"]:
+        if node_config["instance_type"] == None:
+            return ("bare_metal", "TXP")
+        elif "p2" in node_config["instance_type"]:
             if node_config["gpus_per_replica"] > 0:
                 return ("aws", "k80")
             else:
@@ -103,11 +105,8 @@ def get_gpu_type(node_config):
                 return ("aws", "v100")
             else:
                 return ("aws", "none")
-
         else:
-            print("Error: unknown GPU type for instance type {}".format(
-                node_config["instance_type"]))
-            return None
+            print("Error: Unknown GPU type from instance_type of {}".format(node_config["instance_type"]))
     elif "cloud" in node_config:
         gpu_type = node_config["gpu_type"]
         if gpu_type is None:
@@ -245,7 +244,7 @@ def create_node_profile_df(results_dir):
 
 
 def load_single_node_profiles(
-        single_node_profs_dir=os.path.abspath("../results_cpp_benchmarker/single_model_profs_contention_tuned/"),
+        single_node_profs_dir="../results_cpp_benchmarker/single_model_profs_contention_tuned/",
         models=[]):
     """
     Returns
@@ -256,6 +255,7 @@ def load_single_node_profiles(
         not necessarily match the directory name of the directory containing the profiling results
         for that node.
     """
+    single_node_profs_dir = os.path.abspath(single_node_profs_dir)
     logger.info("Loading profs from {}".format(os.path.basename(single_node_profs_dir)))
     profs = {}
     for m in os.listdir(single_node_profs_dir):

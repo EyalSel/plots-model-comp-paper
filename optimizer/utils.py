@@ -1,5 +1,4 @@
-# COST_PER_CPU = 4.75 / 100.0
-# COST_PER_GPU = 70.0 / 100.0
+import numpy as np
 
 AWS_CPU_COST = 0.0665
 AWS_K80_COST = 0.634
@@ -9,6 +8,8 @@ GCP_CPU_COST = 0.039
 GCP_K80_COST = 0.315
 GCP_P100_COST = 1.022
 
+BARE_METAL_CPU_COST = np.inf
+BARE_METAL_TXP_COST = np.inf
 
 # NOTE: This cost is the cost of physical cpus, not virtual cpus
 def get_cpu_cost(cloud, num_cpus):
@@ -16,6 +17,8 @@ def get_cpu_cost(cloud, num_cpus):
         return num_cpus * AWS_CPU_COST
     elif cloud == "gcp":
         return num_cpus * GCP_CPU_COST
+    elif cloud == "bare_metal":
+        return num_cpus * BARE_METAL_CPU_COST
     else:
         raise Exception("Unsupported cloud: {}".format(cloud))
 
@@ -37,5 +40,10 @@ def get_gpu_cost(cloud, gpu_type, num_gpus=1):
             return num_gpus * GCP_P100_COST
         elif gpu_type == "none" or gpu_type is None:
             return 0
+        else:
+            raise Exception("Unsupported gpu type: {} for cloud {}".format(gpu_type, cloud))
+    elif cloud == "bare_metal":
+        if gpu_type == "TXP":
+            return num_gpus * BARE_METAL_TXP_COST
         else:
             raise Exception("Unsupported gpu type: {} for cloud {}".format(gpu_type, cloud))
