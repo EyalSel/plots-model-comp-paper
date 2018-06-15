@@ -108,7 +108,7 @@ class NodeConfig(object):
 
 class NodeProfile(object):
 
-    def __init__(self, name, profile, throughput_stage, utilization, latency_perc=1.0):
+    def __init__(self, name, profile, throughput_stage, utilization=1.0, latency_perc=1.0):
         """
         Parameters:
         -----------
@@ -171,13 +171,16 @@ class NodeProfile(object):
                 print("Profile for node {name} bundle {bundle} is non-monotonic".format(
                     name=self.name, bundle=bundle))
 
-    def plot_profile(self):
+    def plot_profile(self, just_values = False):
         resource_bundle_groups = self.profile.groupby(["cloud",
                                                        "gpu_type",
                                                        "num_cpus_per_replica"])
         for bundle, df in resource_bundle_groups:
             title = "_".join([str(b) for b in bundle])
             sorted_df = df.sort_values("mean_batch_size")
+            if just_values:
+                sorted_df = df.sort_values("mean_batch_size")
+                return sorted_df["mean_batch_size"], sorted_df["latency_stage_mean_throughput_qps"], sorted_df["thru_stage_mean_throughput_qps"], sorted_df["p99_latency"]
             fig, (ax_thru, ax_lat) = plt.subplots(nrows=1, ncols=2, figsize=(14, 5))
             fig.suptitle(title)
             ax_thru.plot(sorted_df["mean_batch_size"],
@@ -212,7 +215,7 @@ class NodeProfile(object):
             ax_thru.set_xlim(left=0)
             ax_thru.legend(loc=0)
         plt.show()
-
+        
     def increase_batch_size(self, config):
         """
         Returns a config with a larger batch size or False if the batch size
