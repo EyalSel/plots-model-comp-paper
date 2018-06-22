@@ -16,7 +16,9 @@ private:
   clock_time sink_time;
 public:
   const int id;
-  Query(clock_time src, int id): id(id), source_time(src) {};
+  Query(int id, clock_time src): id(id) {
+    source_time = src;
+  };
   ~Query(){};
   void sink(clock_time snk){
     sink_time = snk;
@@ -30,7 +32,6 @@ private:
   vector<Node*> parents;
 public:
   const string name;
-  
   Node(string name): name(name) {
     printf("Node %s constructor\n", name.c_str());
   };
@@ -40,33 +41,13 @@ public:
     node -> parents.push_back(node);
   }
 
-  virtual void arrival(Query* [] queries, int num_queries);
+  // The arrival method guarantees read-only access to the queries array
+  virtual void arrival(Query** queries, int num_queries, clock_time time_now);
 
-  void send(Query*[] queries, int num_queries) {
+  void send(Query** queries, int num_queries, clock_time time_now) {
     for(vector<Node*>::iterator it = children.begin(); it != children.end(); ++it) {
-      (*it) -> arrival(queries, num_queries);
+      (*it) -> arrival(queries, num_queries, time_now);
     }
-  }
-
-  ~Node(){};
-  
-};
-
-class QueuedNode : public Node
-{
-protected:
-  std::queue<Query> arrival_queue;
-
-public:
-  
-  QueuedNode(string name): Node(name), arrival_queue(queue<Query>()){
-    printf("QueuedNode %s constructor\n", name.c_str());
-  };
-
-  ~QueuedNode(){};
-
-  void arrival(Query* queries, int num_queries) {
-
   }
   
 };
@@ -76,24 +57,185 @@ class SourceNode : public Node
 private:
   pair<float*, int> deltas;
   int next_query_index;
+  vector<Query> query_array;
 public:
-  SourceNode(string name, pair<float*, int> deltas): 
-    Node(name), deltas(deltas), next_query_index(0) {
+  SourceNode(pair<float*, int> deltas): 
+    Node("source"), deltas(deltas) {
+    next_query_index = 0;
+    query_array.reserve(deltas.second);
     printf("SourceNode %s constructor\n", name.c_str());
   };
-  ~SourceNode();
+  ~SourceNode() {
+    delete deltas.first;
+  };
 
-  float send_next() {
+  float send_next(clock_time time_now) {
     if (next_query_index == deltas.second) {
-      return -1
+      return -1;
     }
-    send()
+    query_array.push_back(Query(time_now, next_query_index));
+    Query* argument_array[1];
+    argument_array[0] = &(query_array[next_query_index]);
+    send(argument_array, 1, time_now);
     next_query_index++;
     return deltas.first[next_query_index-1];
   }
   
 };
 
+class QueuedNode : public Node
+{
+protected:
+  std::queue<Query*> arrival_queue;
+
+public:
+  
+  QueuedNode(string name): Node(name){
+    printf("QueuedNode %s constructor\n", name.c_str());
+  };
+
+  void arrival(Query** queries, int num_queries, clock_time time_now) {
+    for(int i = 0; i < num_queries; i++){
+      arrival_queue.push(queries[i]);
+    }
+  }
+  
+};
+
+class BatchedNode:public QueuedNode
+{
+private:
+  // A vector converted from a (flattened) numpy array of shape N * 3, 
+  // where each entry represents profiler results for the model.
+  // the first column of the array represents the batch size
+  // the second column of the array represents the p99 latency in ms
+  // the third column of the array represents the throughput in qps
+  vector<float> batchsize_p99lat_thru;
+  // A vector of just the batchsizes, initialized in extract_batchsizes()
+  // called in the constructor
+  vector<int> batchsizes;
+
+  void extract_batchsizes() {
+    for (int i = 0; i < batchsize_p99lat_thru.size(); i+=3) {
+      batchsizes.push_back((int)(batchsize_p99lat_thru[i]));
+    }
+  }
+
+  // Given entry (the row in the original numpy array) return delay
+  // calculated from throughput (so mean, not p99)
+  float get_delay_for_entry(int entry_id) {
+    return 1/batchsize_p99lat_thru[entry_id*3+2]*1000;
+  }
+
+  // Given a batchsize, returns the predicted latency by connecting a line
+  // between the closes profiled batchsizes above and below the given batchsize   
+  float latency_for_batchsize(int batchsize) {
+    int num_batchsize_entries = batchsizes.size();
+    int lowest_batchsize = batchsizes[0];
+    int highest_batchsize = batchsizes.end()[-1];
+    assert (batchsize <= highest_batchsize && batchsize >= lowest_batchsize);
+    int index = 0;
+    for (; index < batchsizes.size(); ++index) {
+      int batchsize_entry = batchsizes[index];
+      if (batchsize == batchsize_entry) {
+        return get_delay_for_entry(index);
+      }
+      if (batchsize_entry > batchsize) {
+        break;
+      }
+    }
+    int batchsize_below = batchsizes[index-1];
+    int batchsize_above = batchsizes[index];
+    float batchsize_below_latency = get_delay_for_entry(index-1);
+    float batchsize_above_latency = get_delay_for_entry(index);
+    float rise = batchsize_above_latency - batchsize_below_latency;
+    float run  = batchsize_above - batchsize_below;
+    float slope = rise/run;
+    float delta = batchsize - batchsize_below;
+    return batchsize_below_latency + delta * slope;
+  }
+
+  // a vector of vectors, each represents a queue for a replica.
+  vector< vector<Query*> > replica_queues;
+
+public:
+  const int max_batchsize;
+  const int num_replicas;
+  
+  BatchedNode(string name, int max_batchsize, vector<float>batchsize_p99lat_thru, int num_replicas)
+    :QueuedNode(name),max_batchsize(max_batchsize),num_replicas(num_replicas),batchsize_p99lat_thru(batchsize_p99lat_thru){
+      extract_batchsizes();
+      for (int i = 0; i < num_replicas; ++i)
+      {
+        replica_queues.push_back(vector<Query*>());
+      }
+  }
+
+  void arrival(Query** queries, int num_queries, clock_time time_now) {
+    Node::arrival(queries, num_queries, time_now);
+
+  }
+
+  void finish_processing(int replica_index, clock_time time_now) {
+    vector<Query*> replica_queue = replica_queues[replica_index];
+    assert (replica_queue.size() > 0);
+    // Create an array pointer to the vector's contents
+    Query** array_pointer = &replica_queue[0];
+    send(array_pointer, replica_queue.size(), time_now);
+    replica_queue.clear();
+  }
+
+};
+
+class SinkNode:public Node
+{
+public:
+  SinkNode(string name): Node(name){}
+
+  virtual void arrival(Query** queries, int num_queries, clock_time time_now) {
+    for (int i = 0; i < num_queries; ++i)
+    {
+      queries[i] -> sink(time_now);
+    }
+  }
+
+};
+
+typedef pair<Node*, clock_time> event;
+
+class Scheduler
+{
+private:
+  clock_time time_now;
+  // returns true if a is less than b. Because the priority queue
+  // takes items out by larger first, returning true means that
+  // a should be taken AFTER b
+  static bool compare(event a, event b) {
+    return a.second > b.second;
+  }
+  priority_queue < event, vector<event> , function<bool(event,event)> > scheduled;
+
+public:
+  Scheduler(): scheduled(compare) {
+    time_now = 0;
+  };
+
+  void schedule(Node* node, clock_time in_how_long) {
+    // event is not a function, it's a typedef of a pair (see above)
+    event new_event = event (node, time_now + in_how_long);
+    scheduled.push(new_event);
+  }
+
+  void run() {
+    while (!scheduled.empty()) {
+      event next_event = scheduled.front();
+      next_event.first -> 
+      scheduled.pop();
+    }
+  }
+
+  /* data */
+};
 
 pair<float*, int> read_deltas_file(string file_name){
   // first count how many lines in file
@@ -121,20 +263,21 @@ pair<float*, int> read_deltas_file(string file_name){
   return pair<float*, int>(result, number_of_lines);
 }
 
+float mean(pair<float*, int> array) {
+  float sum = 0;
+  for(int i = 0; i < array.second; i++) {
+    sum+=array.first[i];
+  }
+  return sum / array.second;
+}
 
 int main(int argc, char const *argv[])
 {
   printf("argc = %d\n", argc);
-  if (argc < 2) {
-    return 0;
+  if (argc == 2) {
+    pair<float*, int> result = read_deltas_file(argv[1]);
+    printf("Mean: %f\n", mean(result));
   }
-  pair<float*, int> result = read_deltas_file(argv[1]);
-  float sum = 0;
-  for(int i = 0; i < result.second; i++) {
-    sum+=result.first[i];
-  }
-  float mean = sum / result.second;
-  printf("Mean: %f\n", mean);
-  QueuedNode queuedNode("hello");
+
   return 0;
 }
