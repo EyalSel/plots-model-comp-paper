@@ -56,8 +56,8 @@ public:
   void run() {
     while (!scheduled.empty()) {
       event next_event = scheduled.top();
-      get<0>(next_event) -> to_schedule(get<1>(next_event), get<2>(next_event));
       scheduled.pop();
+      get<0>(next_event) -> to_schedule(get<1>(next_event), get<2>(next_event));
     }
   }
 
@@ -68,6 +68,8 @@ class Node
 private:
   vector<Node*> children;
   vector<Node*> parents;
+  int num_parents;
+  int num_children;
   Scheduler scheduler;
 public:
   const string name;
@@ -78,6 +80,8 @@ public:
   void then(Node* node) {
     children.push_back(node);
     node -> parents.push_back(node);
+    node -> num_parents++;
+    num_children++;
   }
 
   // The arrival method guarantees read-only access to the queries array
@@ -91,6 +95,14 @@ public:
 
   // To be called by the scheduler
   virtual void to_schedule(clock_time time_now, int identifier);
+
+  int get_num_parents(){
+    return num_parents;
+  }
+
+  int get_num_children(){
+    return num_children;
+  }
   
 };
 
@@ -218,13 +230,15 @@ public:
   void arrival(Query** queries, int num_queries, clock_time time_now) {
     Node::arrival(queries, num_queries, time_now);
     assert (!arrival_queue.empty());
-    for(vector< vector<Query*> >::iterator it = replica_queues.begin(); it != replica_queues.end(); ++it) {
-      if (it -> empty()) {
+    for(int i = 0; i < num_replicas; i++) {
+      if (replica_queues[i] -> empty()) {
         int num_to_dequeue = min(max_batchsize, arrival_queue.size());
-        for (int i = 0; i < num_to_dequeue; ++i) {
-          it -> push_back(queries[i]);
+        for (int j = 0; j < num_to_dequeue; j++) {
+          Query* next_query = arrival_queue.begin();
+          arrival_queue.pop();
+          replica_queues[i] -> push_back(next_query);
         }
-        scheduler.schedule()
+        scheduler.schedule(this, latency_for_batchsize(num_to_dequeue), i);
       }
     }
   }
@@ -239,7 +253,7 @@ public:
   }
 
   void to_schedule(clock_time time_now, int identifier) {
-    finish_processing(identifierm, time_now);
+    finish_processing(identifier, time_now);
   }
 
 };
@@ -253,6 +267,36 @@ public:
     for (int i = 0; i < num_queries; ++i)
     {
       queries[i] -> sink(time_now);
+    }
+  }
+
+};
+
+class JoinNode:Node
+{
+private:
+    // A mapping from a query pointer to the number of times that query
+    // has been received. When that number equals the number of parents
+    // that this node has, that query can be sent on to the children
+    unordered_map<Query*, int> queries_frequency;
+public:
+  JoinNode(string name, Scheduler scheduler):Node(name, scheduler) {}
+
+  void arrival(Query** queries, int num_queries, clock_time time_now) {
+    for (int i = 0; i < num_queries; i++) {
+      auto search_result = queries_frequency.find(queries[i]);
+      if(search_result == example.end()) {
+        // not found
+        queries_frequency.insert(make_pair(queries[i], 1));
+      } else {
+          // found
+          if (search_result -> second < get_num_children()-1) {
+            queries_frequency[queries[i]] = search_result -> second + 1;
+          } else {
+            queries_frequency.erase(queries[i]);
+            send(&queries[i], 1, time_now);
+          }
+      }
     }
   }
 
