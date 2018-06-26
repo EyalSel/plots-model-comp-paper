@@ -4,13 +4,13 @@
 #include <fstream>
 #include <assert.h>
 #include <vector>
+#include <unordered_map>
 
 using namespace std;
 
 typedef unsigned long clock_time;
 
-class Query
-{
+class Query {
 private:
   clock_time source_time;
   clock_time sink_time;
@@ -30,8 +30,7 @@ class Node;
 
 typedef tuple<Node*, clock_time, int> event;
 
-class Scheduler
-{
+class Scheduler {
 private:
   clock_time time_now;
   // returns true if a is less than b. Because the priority queue
@@ -41,7 +40,6 @@ private:
     return get<1>(a) > get<1>(b);
   }
   priority_queue < event, vector<event> , function<bool(event,event)> > scheduled;
-
 public:
   Scheduler(): scheduled(compare) {
     time_now = 0;
@@ -53,24 +51,18 @@ public:
     scheduled.push(new_event);
   }
 
-  void run() {
-    while (!scheduled.empty()) {
-      event next_event = scheduled.top();
-      scheduled.pop();
-      get<0>(next_event) -> to_schedule(get<1>(next_event), get<2>(next_event));
-    }
-  }
-
+  // implemented after Node declaration in order to compile
+  void run();
 };
 
-class Node
-{
+class Node {
+protected:
+  Scheduler scheduler;
 private:
   vector<Node*> children;
   vector<Node*> parents;
   int num_parents;
   int num_children;
-  Scheduler scheduler;
 public:
   const string name;
   Node(string name, Scheduler scheduler): name(name), scheduler(scheduler) {
@@ -103,8 +95,17 @@ public:
   int get_num_children(){
     return num_children;
   }
-  
 };
+
+void Scheduler::run() {
+  while (!scheduled.empty()) {
+    event next_event = scheduled.top();
+    scheduled.pop();
+    get<0>(next_event) -> to_schedule(get<1>(next_event), get<2>(next_event));
+  }
+}
+
+
 
 class SourceNode : public Node
 {
@@ -123,20 +124,20 @@ public:
     delete deltas.first;
   };
 
-  void to_schedule(clock_time time_now, int identifier) {
+  void to_schedule(clock_time time_now, int /* unused identifier */) {
     send_next(time_now);
   }
 
-  float send_next(clock_time time_now) {
+  void send_next(clock_time time_now) {
     if (next_query_index == deltas.second) {
       printf("Source node finished sending all the queries!\n");
     }
     query_array.push_back(Query(time_now, next_query_index));
-    send(&(query_array[next_query_index]), 1, time_now);
+    Query* pointer = (query_array.data() + next_query_index);
+    send(&pointer, 1, time_now);
     next_query_index++;
     scheduler.schedule(this, deltas.first[next_query_index-1]);
   }
-  
 };
 
 class QueuedNode : public Node
@@ -150,7 +151,7 @@ public:
     printf("QueuedNode %s constructor\n", name.c_str());
   };
 
-  void arrival(Query** queries, int num_queries, clock_time time_now) {
+  void arrival(Query** queries, int num_queries, clock_time /* unused time_now */) {
     for(int i = 0; i < num_queries; i++){
       arrival_queue.push(queries[i]);
     }
@@ -169,11 +170,13 @@ private:
   vector<float> batchsize_p99lat_thru;
   // A vector of just the batchsizes, initialized in extract_batchsizes()
   // called in the constructor
-  vector<int> batchsizes;
+  vector<unsigned int> batchsizes;
 
   void extract_batchsizes() {
-    for (int i = 0; i < batchsize_p99lat_thru.size(); i+=3) {
-      batchsizes.push_back((int)(batchsize_p99lat_thru[i]));
+    for (unsigned int i = 0; i < batchsize_p99lat_thru.size(); i+=3) {
+      int value_from_array = (int)batchsize_p99lat_thru[i];
+      assert (value_from_array > 0);
+      batchsizes.push_back((unsigned int)value_from_array);
     }
   }
 
@@ -190,7 +193,7 @@ private:
     int lowest_batchsize = batchsizes[0];
     int highest_batchsize = batchsizes.end()[-1];
     assert (batchsize <= highest_batchsize && batchsize >= lowest_batchsize);
-    int index = 0;
+    unsigned int index = 0;
     for (; index < batchsizes.size(); ++index) {
       int batchsize_entry = batchsizes[index];
       if (batchsize == batchsize_entry) {
@@ -214,6 +217,18 @@ private:
   // a vector of vectors, each represents a queue for a replica.
   vector< vector<Query*> > replica_queues;
 
+  // Replica takes from queue as much as it can. Must be called when there's something in queue
+  // and replica is not processing something already
+  void replica_take(int replica_index) {
+    assert (!arrival_queue.empty() && replica_queues[replica_index].empty());
+    int num_to_dequeue = min<int>(max_batchsize, arrival_queue.size());
+    for (int j = 0; j < num_to_dequeue; j++) {
+      Query* next_query = arrival_queue.front(); 
+      replica_queues[replica_index].push_back(next_query);
+      arrival_queue.pop();
+    }
+    scheduler.schedule(this, latency_for_batchsize(num_to_dequeue), replica_index);
+  }
 public:
   const int max_batchsize;
   const int num_replicas;
@@ -221,8 +236,7 @@ public:
   BatchedNode(string name, int max_batchsize, vector<float>batchsize_p99lat_thru, int num_replicas, Scheduler scheduler)
     :QueuedNode(name,scheduler),max_batchsize(max_batchsize),num_replicas(num_replicas),batchsize_p99lat_thru(batchsize_p99lat_thru){
       extract_batchsizes();
-      for (int i = 0; i < num_replicas; ++i)
-      {
+      for (int i = 0; i < num_replicas; ++i) {
         replica_queues.push_back(vector<Query*>());
       }
   }
@@ -231,14 +245,11 @@ public:
     Node::arrival(queries, num_queries, time_now);
     assert (!arrival_queue.empty());
     for(int i = 0; i < num_replicas; i++) {
-      if (replica_queues[i] -> empty()) {
-        int num_to_dequeue = min(max_batchsize, arrival_queue.size());
-        for (int j = 0; j < num_to_dequeue; j++) {
-          Query* next_query = arrival_queue.begin();
-          arrival_queue.pop();
-          replica_queues[i] -> push_back(next_query);
+      if (replica_queues[i].empty()) {
+        replica_take(i);
+        if (arrival_queue.empty()) {
+          break;
         }
-        scheduler.schedule(this, latency_for_batchsize(num_to_dequeue), i);
       }
     }
   }
@@ -250,26 +261,14 @@ public:
     Query** array_pointer = &replica_queue[0];
     send(array_pointer, replica_queue.size(), time_now);
     replica_queue.clear();
+    if (!arrival_queue.empty()) {
+      replica_take(replica_index);
+    }
   }
 
   void to_schedule(clock_time time_now, int identifier) {
     finish_processing(identifier, time_now);
   }
-
-};
-
-class SinkNode:public Node
-{
-public:
-  SinkNode(string name, Scheduler scheduler): Node(name, scheduler){}
-
-  virtual void arrival(Query** queries, int num_queries, clock_time time_now) {
-    for (int i = 0; i < num_queries; ++i)
-    {
-      queries[i] -> sink(time_now);
-    }
-  }
-
 };
 
 class JoinNode:Node
@@ -285,11 +284,9 @@ public:
   void arrival(Query** queries, int num_queries, clock_time time_now) {
     for (int i = 0; i < num_queries; i++) {
       auto search_result = queries_frequency.find(queries[i]);
-      if(search_result == example.end()) {
-        // not found
+      if(search_result == queries_frequency.end()) { // not found
         queries_frequency.insert(make_pair(queries[i], 1));
-      } else {
-          // found
+      } else { // found
           if (search_result -> second < get_num_children()-1) {
             queries_frequency[queries[i]] = search_result -> second + 1;
           } else {
@@ -299,7 +296,19 @@ public:
       }
     }
   }
+};
 
+class SinkNode:public Node
+{
+public:
+  SinkNode(string name, Scheduler scheduler): Node(name, scheduler){}
+
+  virtual void arrival(Query** queries, int num_queries, clock_time time_now) {
+    for (int i = 0; i < num_queries; ++i)
+    {
+      queries[i] -> sink(time_now);
+    }
+  }
 };
 
 pair<float*, int> read_deltas_file(string file_name){
