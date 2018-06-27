@@ -28,10 +28,48 @@ public:
   }
 };
 
-// Forward declaration. The class can be found below the Scheduler class below.
-class Node;
+class Node {
+protected:
+  // The arrival method guarantees read-only access to the queries array
+  virtual void arrival(Query** queries, int num_queries, clock_time time_now) = 0;
 
-typedef tuple<Node*, clock_time, int> event;
+  void send(Query** queries, int num_queries, clock_time time_now) {
+    for(vector<Node*>::iterator it = children.begin(); it != children.end(); ++it) {
+      (*it) -> arrival(queries, num_queries, time_now);
+    }
+  }
+private:
+  vector<Node*> children;
+  vector<Node*> parents;
+  int num_parents;
+  int num_children;
+public:
+  const string name;
+  Node(string name): name(name) {
+    printf("Node %s constructor\n", name.c_str());
+  };
+
+  void then(Node* node) {
+    children.push_back(node);
+    node -> parents.push_back(node);
+    node -> num_parents++;
+    num_children++;
+  }
+
+  int get_num_parents(){
+    return num_parents;
+  }
+
+  int get_num_children(){
+    return num_children;
+  }
+
+};
+
+// Forward declaration. The class can be found below the Scheduler class below.
+class SchedulableNode : virtual public Node;
+
+typedef tuple<SchedulableNode*, clock_time, int> event;
 
 class Scheduler {
 private:
@@ -48,7 +86,7 @@ public:
     time_now = 0;
   };
 
-  void schedule(Node* node, clock_time in_how_long, int identifier = 0) {
+  void schedule(SchedulableNode* node, clock_time in_how_long, int identifier = 0) {
     // event is not a function, it's a typedef of a tuple (see above)
     event new_event (node, time_now + in_how_long, identifier);
     scheduled.push(new_event);
@@ -58,46 +96,16 @@ public:
   void run();
 };
 
-class Node {
-protected:
+class SchedulableNode : virtual public Node
+{
+protected: 
   Scheduler* scheduler;
-private:
-  vector<Node*> children;
-  vector<Node*> parents;
-  int num_parents;
-  int num_children;
 public:
-  const string name;
-  Node(string name, Scheduler* scheduler): name(name), scheduler(scheduler) {
-    printf("Node %s constructor\n", name.c_str());
-  };
-
-  void then(Node* node) {
-    children.push_back(node);
-    node -> parents.push_back(node);
-    node -> num_parents++;
-    num_children++;
+  SchedulableNode(string name, Scheduler* scheduler): Node(name), scheduler(scheduler) {
+    printf("SchedulableNode %s constructor\n", name.c_str());
   }
-
-  // The arrival method guarantees read-only access to the queries array
-  virtual void arrival(Query** queries, int num_queries, clock_time time_now);
-
-  void send(Query** queries, int num_queries, clock_time time_now) {
-    for(vector<Node*>::iterator it = children.begin(); it != children.end(); ++it) {
-      (*it) -> arrival(queries, num_queries, time_now);
-    }
-  }
-
   // To be called by the scheduler
-  virtual void to_schedule(clock_time time_now, int identifier);
-
-  int get_num_parents(){
-    return num_parents;
-  }
-
-  int get_num_children(){
-    return num_children;
-  }
+  virtual void to_schedule(clock_time time_now, int identifier) = 0;
 };
 
 void Scheduler::run() {
@@ -108,17 +116,44 @@ void Scheduler::run() {
   }
 }
 
+class QueuedNode : virtual public Node
+{
+protected:
+  std::queue<Query*> arrival_queue;
+  
+  void arrival(Query** queries, int num_queries, clock_time /* unused time_now */) {
+    for(int i = 0; i < num_queries; i++){
+      arrival_queue.push(queries[i]);
+    }
+  }
+public:
+  QueuedNode(string name, Scheduler* scheduler): Node(name, scheduler){
+    printf("QueuedNode %s constructor\n", name.c_str());
+  }; 
+};
 
 
-class SourceNode : public Node
+class SourceNode : public SchedulableNode
 {
 private:
   pair<float*, int> deltas;
   int next_query_index;
   vector<Query> query_array;
+
+  void send_next(clock_time time_now) {
+    if (next_query_index == deltas.second) {
+      printf("Source node finished sending all the queries!\n");
+    }
+    query_array.push_back(Query(time_now, next_query_index));
+    Query* pointer = (query_array.data() + next_query_index);
+    send(&pointer, 1, time_now);
+    next_query_index++;
+    scheduler -> schedule(this, deltas.first[next_query_index-1]);
+  }
+
 public:
   SourceNode(pair<float*, int> deltas, Scheduler* scheduler): 
-    Node("source", scheduler), deltas(deltas) {
+    SchedulableNode("source", scheduler), deltas(deltas) {
     next_query_index = 0;
     query_array.reserve(deltas.second);
     printf("SourceNode %s constructor\n", name.c_str());
@@ -131,38 +166,10 @@ public:
     send_next(time_now);
   }
 
-  void send_next(clock_time time_now) {
-    if (next_query_index == deltas.second) {
-      printf("Source node finished sending all the queries!\n");
-    }
-    query_array.push_back(Query(time_now, next_query_index));
-    Query* pointer = (query_array.data() + next_query_index);
-    send(&pointer, 1, time_now);
-    next_query_index++;
-    scheduler -> schedule(this, deltas.first[next_query_index-1]);
-  }
-};
-
-class QueuedNode : public Node
-{
-protected:
-  std::queue<Query*> arrival_queue;
-
-public:
-  
-  QueuedNode(string name, Scheduler* scheduler): Node(name, scheduler){
-    printf("QueuedNode %s constructor\n", name.c_str());
-  };
-
-  void arrival(Query** queries, int num_queries, clock_time /* unused time_now */) {
-    for(int i = 0; i < num_queries; i++){
-      arrival_queue.push(queries[i]);
-    }
-  }
   
 };
 
-class BatchedNode:public QueuedNode
+class BatchedNode : public QueuedNode, public SchedulableNode
 {
 private:
   // A vector converted from a (flattened) numpy array of shape N * 3, 
@@ -232,18 +239,18 @@ private:
     }
     scheduler -> schedule(this, latency_for_batchsize(num_to_dequeue), replica_index);
   }
-public:
-  const int max_batchsize;
-  const int num_replicas;
-  
-  BatchedNode(string name, int max_batchsize, vector<float>batchsize_p99lat_thru, int num_replicas, Scheduler* scheduler)
-    :QueuedNode(name,scheduler),max_batchsize(max_batchsize),num_replicas(num_replicas),batchsize_p99lat_thru(batchsize_p99lat_thru){
-      extract_batchsizes();
-      for (int i = 0; i < num_replicas; ++i) {
-        replica_queues.push_back(vector<Query*>());
-      }
+  void finish_processing(int replica_index, clock_time time_now) {
+    vector<Query*> replica_queue = replica_queues[replica_index];
+    assert (replica_queue.size() > 0);
+    // Create an array pointer to the vector's contents
+    Query** array_pointer = &replica_queue[0];
+    send(array_pointer, replica_queue.size(), time_now);
+    replica_queue.clear();
+    if (!arrival_queue.empty()) {
+      replica_take(replica_index);
+    }
   }
-
+protected:
   void arrival(Query** queries, int num_queries, clock_time time_now) {
     Node::arrival(queries, num_queries, time_now);
     assert (!arrival_queue.empty());
@@ -257,33 +264,30 @@ public:
     }
   }
 
-  void finish_processing(int replica_index, clock_time time_now) {
-    vector<Query*> replica_queue = replica_queues[replica_index];
-    assert (replica_queue.size() > 0);
-    // Create an array pointer to the vector's contents
-    Query** array_pointer = &replica_queue[0];
-    send(array_pointer, replica_queue.size(), time_now);
-    replica_queue.clear();
-    if (!arrival_queue.empty()) {
-      replica_take(replica_index);
-    }
+public:
+  const int max_batchsize;
+  const int num_replicas;
+  
+  BatchedNode(string name, int max_batchsize, pair<float*, int> model_behavior, int num_replicas, Scheduler* scheduler)
+    :QueuedNode(name), SchedulableNode(name, scheduler), Node(name), max_batchsize(max_batchsize),num_replicas(num_replicas),batchsize_p99lat_thru(model_behavior.first, model_behavior.first+model_behavior.second){
+      extract_batchsizes();
+      for (int i = 0; i < num_replicas; ++i) {
+        replica_queues.push_back(vector<Query*>());
+      }
   }
-
   void to_schedule(clock_time time_now, int identifier) {
     finish_processing(identifier, time_now);
   }
 };
 
-class JoinNode:Node
+class JoinNode : public QueuedNode
 {
 private:
     // A mapping from a query pointer to the number of times that query
     // has been received. When that number equals the number of parents
     // that this node has, that query can be sent on to the children
     unordered_map<Query*, int> queries_frequency;
-public:
-  JoinNode(string name, Scheduler* scheduler):Node(name, scheduler) {}
-
+protected:
   void arrival(Query** queries, int num_queries, clock_time time_now) {
     for (int i = 0; i < num_queries; i++) {
       auto search_result = queries_frequency.find(queries[i]);
@@ -299,13 +303,15 @@ public:
       }
     }
   }
+public:
+  JoinNode(string name, Scheduler* scheduler):QueuedNode(name, scheduler) {}
 };
 
-class SinkNode:public Node
+class SinkNode : public QueuedNode
 {
 public:
-  SinkNode(Scheduler* scheduler): Node("sink", scheduler){}
-
+  SinkNode(Scheduler* scheduler): QueuedNode("sink", scheduler){}
+protected:
   virtual void arrival(Query** queries, int num_queries, clock_time time_now) {
     for (int i = 0; i < num_queries; ++i)
     {
@@ -348,6 +354,13 @@ float mean(pair<float*, int> array) {
 }
 
 namespace po = boost::program_options;
+
+pair<float*,int> extract_cnpy(cnpy::NpyArray arr) {
+  vector<size_t> the_shape = arr.shape;
+  assert (arr.shape.size() == 2 && arr.shape[1] == 3);
+  int size = arr.shape[0] * arr.shape[1];
+  return pair<float*, int>(arr.data<float>(), size);
+}
 
 int main(int argc, char const *argv[])
 {
@@ -415,21 +428,21 @@ int main(int argc, char const *argv[])
   cnpy::NpyArray logreg_behavior = cnpy::npy_load(lbe);
   cnpy::NpyArray ksvm_behavior = cnpy::npy_load(kbe);
 
-  Scheduler scheduler();
+  Scheduler scheduler;
   SourceNode source (result, &scheduler);
-  BatchedNode inception ("Inception", ibs, inception_behavior, irp, &scheduler);
-  BatchedNode resnet ("ResNet", rbs, resnet_behavior, rrp, &scheduler);
-  BatchedNode logreg ("LogReg", lbs, logreg_behavior, lrp, &scheduler);
-  BatchedNode ksvm ("KSVM", kbs, ksvm_behavior, krp, &scheduler);
+  BatchedNode inception ("Inception", ibs, extract_cnpy(inception_behavior), irp, &scheduler);
+  BatchedNode resnet ("ResNet", rbs, extract_cnpy(resnet_behavior), rrp, &scheduler);
+  BatchedNode logreg ("LogReg", lbs, extract_cnpy(logreg_behavior), lrp, &scheduler);
+  BatchedNode ksvm ("KSVM", kbs, extract_cnpy(ksvm_behavior), krp, &scheduler);
   JoinNode join ("Join", &scheduler);
   SinkNode sink (&scheduler);
-  source.then(inception);
-  source.then(resnet);
-  inception.then(logreg);
-  resnet.then(ksvm);
-  logreg.then(join);
-  ksvm.then(join);
-  join.then(sink);
+  source.then(&inception);
+  source.then(&resnet);
+  inception.then(&logreg);
+  resnet.then(&ksvm);
+  logreg.then(&join);
+  ksvm.then(&join);
+  join.then(&sink);
 
   return 0;
 }
