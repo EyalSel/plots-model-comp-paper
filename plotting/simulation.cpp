@@ -5,6 +5,9 @@
 #include <assert.h>
 #include <vector>
 #include <unordered_map>
+#include <functional>
+#include <boost/program_options.hpp>
+#include "cnpy.h"
 
 using namespace std;
 
@@ -57,7 +60,7 @@ public:
 
 class Node {
 protected:
-  Scheduler scheduler;
+  Scheduler* scheduler;
 private:
   vector<Node*> children;
   vector<Node*> parents;
@@ -65,7 +68,7 @@ private:
   int num_children;
 public:
   const string name;
-  Node(string name, Scheduler scheduler): name(name), scheduler(scheduler) {
+  Node(string name, Scheduler* scheduler): name(name), scheduler(scheduler) {
     printf("Node %s constructor\n", name.c_str());
   };
 
@@ -114,7 +117,7 @@ private:
   int next_query_index;
   vector<Query> query_array;
 public:
-  SourceNode(pair<float*, int> deltas, Scheduler scheduler): 
+  SourceNode(pair<float*, int> deltas, Scheduler* scheduler): 
     Node("source", scheduler), deltas(deltas) {
     next_query_index = 0;
     query_array.reserve(deltas.second);
@@ -136,7 +139,7 @@ public:
     Query* pointer = (query_array.data() + next_query_index);
     send(&pointer, 1, time_now);
     next_query_index++;
-    scheduler.schedule(this, deltas.first[next_query_index-1]);
+    scheduler -> schedule(this, deltas.first[next_query_index-1]);
   }
 };
 
@@ -147,7 +150,7 @@ protected:
 
 public:
   
-  QueuedNode(string name, Scheduler scheduler): Node(name, scheduler){
+  QueuedNode(string name, Scheduler* scheduler): Node(name, scheduler){
     printf("QueuedNode %s constructor\n", name.c_str());
   };
 
@@ -227,13 +230,13 @@ private:
       replica_queues[replica_index].push_back(next_query);
       arrival_queue.pop();
     }
-    scheduler.schedule(this, latency_for_batchsize(num_to_dequeue), replica_index);
+    scheduler -> schedule(this, latency_for_batchsize(num_to_dequeue), replica_index);
   }
 public:
   const int max_batchsize;
   const int num_replicas;
   
-  BatchedNode(string name, int max_batchsize, vector<float>batchsize_p99lat_thru, int num_replicas, Scheduler scheduler)
+  BatchedNode(string name, int max_batchsize, vector<float>batchsize_p99lat_thru, int num_replicas, Scheduler* scheduler)
     :QueuedNode(name,scheduler),max_batchsize(max_batchsize),num_replicas(num_replicas),batchsize_p99lat_thru(batchsize_p99lat_thru){
       extract_batchsizes();
       for (int i = 0; i < num_replicas; ++i) {
@@ -279,7 +282,7 @@ private:
     // that this node has, that query can be sent on to the children
     unordered_map<Query*, int> queries_frequency;
 public:
-  JoinNode(string name, Scheduler scheduler):Node(name, scheduler) {}
+  JoinNode(string name, Scheduler* scheduler):Node(name, scheduler) {}
 
   void arrival(Query** queries, int num_queries, clock_time time_now) {
     for (int i = 0; i < num_queries; i++) {
@@ -301,7 +304,7 @@ public:
 class SinkNode:public Node
 {
 public:
-  SinkNode(string name, Scheduler scheduler): Node(name, scheduler){}
+  SinkNode(Scheduler* scheduler): Node("sink", scheduler){}
 
   virtual void arrival(Query** queries, int num_queries, clock_time time_now) {
     for (int i = 0; i < num_queries; ++i)
@@ -316,7 +319,6 @@ pair<float*, int> read_deltas_file(string file_name){
   ifstream myfile(file_name);
   if(!myfile) {
     printf("Error opening output file\n");
-    system("exit");
     return pair<float*, int>(nullptr, 0);
   }
   string line;
@@ -345,13 +347,89 @@ float mean(pair<float*, int> array) {
   return sum / array.second;
 }
 
+namespace po = boost::program_options;
+
 int main(int argc, char const *argv[])
 {
-  printf("argc = %d\n", argc);
-  if (argc == 2) {
-    pair<float*, int> result = read_deltas_file(argv[1]);
+  const size_t ERROR_IN_COMMAND_LINE = 1; 
+  const size_t SUCCESS = 0; 
+  const size_t ERROR_UNHANDLED_EXCEPTION = 2; 
+
+  string deltas_file = "default";
+  int irp = 0;
+  int ibs = 0;
+  string ibe = "default";
+  int rrp = 0;
+  int rbs = 0;
+  string rbe = "default";
+  int lrp = 0;
+  int lbs = 0;
+  string lbe = "default";
+  int krp = 0;
+  int kbs = 0;
+  string kbe = "default";
+  po::options_description desc("C++ simulation");
+  desc.add_options()
+      ("help", "produce help message")
+      ("deltas", po::value<string>(&deltas_file)->required(), "Deltas file with ms difference between queries")
+      ("irp", po::value<int>(&irp)->required(), "Inception replication factor")
+      ("ibs", po::value<int>(&ibs)->required(), "Inception batchsize")
+      ("ibe", po::value<string>(&ibe)->required(), "Inception behavior file")
+      ("rrp", po::value<int>(&rrp)->required(), "ResNet replication factor")
+      ("rbs", po::value<int>(&rbs)->required(), "ResNet batchsize")
+      ("rbe", po::value<string>(&rbe)->required(), "ResNet behavior file")
+      ("lrp", po::value<int>(&lrp)->required(), "LogReg replication factor")
+      ("lbs", po::value<int>(&lbs)->required(), "LogReg batchsize")
+      ("lbe", po::value<string>(&lbe)->required(), "LogReg behavior file")
+      ("krp", po::value<int>(&krp)->required(), "Inception replication factor")
+      ("kbs", po::value<int>(&kbs)->required(), "Inception batchsize")
+      ("kbe", po::value<string>(&kbe)->required(), "Inception behavior file")
+  ;
+  try { 
+    
+    po::variables_map vm;
+    po::store(po::parse_command_line(argc, argv, desc), vm); // can throw 
+
+    if (vm.count("help")) {
+      std::cout << desc << std::endl; 
+      return SUCCESS; 
+    } 
+
+    po::notify(vm); // throws on error, so do after help in case 
+                    // there are any problems 
+
+    printf("%s\n", deltas_file.c_str());
+  } catch(po::error& e) { 
+    std::cerr << "ERROR: " << e.what() << std::endl << std::endl; 
+    std::cerr << desc << std::endl; 
+    return ERROR_IN_COMMAND_LINE; 
+  }
+
+  pair<float*, int> result = read_deltas_file(deltas_file);
+  if (result.first != nullptr) {
     printf("Mean: %f\n", mean(result));
   }
+
+  cnpy::NpyArray inception_behavior = cnpy::npy_load(ibe);
+  cnpy::NpyArray resnet_behavior = cnpy::npy_load(rbe);
+  cnpy::NpyArray logreg_behavior = cnpy::npy_load(lbe);
+  cnpy::NpyArray ksvm_behavior = cnpy::npy_load(kbe);
+
+  Scheduler scheduler();
+  SourceNode source (result, &scheduler);
+  BatchedNode inception ("Inception", ibs, inception_behavior, irp, &scheduler);
+  BatchedNode resnet ("ResNet", rbs, resnet_behavior, rrp, &scheduler);
+  BatchedNode logreg ("LogReg", lbs, logreg_behavior, lrp, &scheduler);
+  BatchedNode ksvm ("KSVM", kbs, ksvm_behavior, krp, &scheduler);
+  JoinNode join ("Join", &scheduler);
+  SinkNode sink (&scheduler);
+  source.then(inception);
+  source.then(resnet);
+  inception.then(logreg);
+  resnet.then(ksvm);
+  logreg.then(join);
+  ksvm.then(join);
+  join.then(sink);
 
   return 0;
 }
