@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <functional>
 #include <boost/program_options.hpp>
+#include <exception>
 #include "cnpy.h"
 
 using namespace std;
@@ -67,7 +68,7 @@ public:
 };
 
 // Forward declaration. The class can be found below the Scheduler class below.
-class SchedulableNode : virtual public Node;
+class SchedulableNode;
 
 typedef tuple<SchedulableNode*, clock_time, int> event;
 
@@ -127,7 +128,7 @@ protected:
     }
   }
 public:
-  QueuedNode(string name, Scheduler* scheduler): Node(name, scheduler){
+  QueuedNode(string name): Node(name){
     printf("QueuedNode %s constructor\n", name.c_str());
   }; 
 };
@@ -153,7 +154,7 @@ private:
 
 public:
   SourceNode(pair<float*, int> deltas, Scheduler* scheduler): 
-    SchedulableNode("source", scheduler), deltas(deltas) {
+    SchedulableNode("source", scheduler), Node("source"), deltas(deltas) {
     next_query_index = 0;
     query_array.reserve(deltas.second);
     printf("SourceNode %s constructor\n", name.c_str());
@@ -162,10 +163,13 @@ public:
     delete deltas.first;
   };
 
-  void to_schedule(clock_time time_now, int /* unused identifier */) {
+  void to_schedule (clock_time time_now, int /* unused identifier */) override {
     send_next(time_now);
   }
 
+  void arrival(Query** /*queries*/, int /*num_queries*/, clock_time /*time_now*/) override {
+    throw logic_error("Arrival function called for source node");
+  }
   
 };
 
@@ -251,8 +255,8 @@ private:
     }
   }
 protected:
-  void arrival(Query** queries, int num_queries, clock_time time_now) {
-    Node::arrival(queries, num_queries, time_now);
+  void arrival(Query** queries, int num_queries, clock_time time_now) override {
+    QueuedNode::arrival(queries, num_queries, time_now);
     assert (!arrival_queue.empty());
     for(int i = 0; i < num_replicas; i++) {
       if (replica_queues[i].empty()) {
@@ -275,7 +279,7 @@ public:
         replica_queues.push_back(vector<Query*>());
       }
   }
-  void to_schedule(clock_time time_now, int identifier) {
+  void to_schedule(clock_time time_now, int identifier) override {
     finish_processing(identifier, time_now);
   }
 };
@@ -288,7 +292,7 @@ private:
     // that this node has, that query can be sent on to the children
     unordered_map<Query*, int> queries_frequency;
 protected:
-  void arrival(Query** queries, int num_queries, clock_time time_now) {
+  void arrival(Query** queries, int num_queries, clock_time time_now) override {
     for (int i = 0; i < num_queries; i++) {
       auto search_result = queries_frequency.find(queries[i]);
       if(search_result == queries_frequency.end()) { // not found
@@ -304,15 +308,15 @@ protected:
     }
   }
 public:
-  JoinNode(string name, Scheduler* scheduler):QueuedNode(name, scheduler) {}
+  JoinNode(string name):QueuedNode(name), Node(name) {}
 };
 
 class SinkNode : public QueuedNode
 {
 public:
-  SinkNode(Scheduler* scheduler): QueuedNode("sink", scheduler){}
+  SinkNode(): QueuedNode("sink"), Node("sink"){}
 protected:
-  virtual void arrival(Query** queries, int num_queries, clock_time time_now) {
+  void arrival(Query** queries, int num_queries, clock_time time_now) override {
     for (int i = 0; i < num_queries; ++i)
     {
       queries[i] -> sink(time_now);
@@ -434,8 +438,8 @@ int main(int argc, char const *argv[])
   BatchedNode resnet ("ResNet", rbs, extract_cnpy(resnet_behavior), rrp, &scheduler);
   BatchedNode logreg ("LogReg", lbs, extract_cnpy(logreg_behavior), lrp, &scheduler);
   BatchedNode ksvm ("KSVM", kbs, extract_cnpy(ksvm_behavior), krp, &scheduler);
-  JoinNode join ("Join", &scheduler);
-  SinkNode sink (&scheduler);
+  JoinNode join ("Join");
+  SinkNode sink;
   source.then(&inception);
   source.then(&resnet);
   inception.then(&logreg);
