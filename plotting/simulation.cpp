@@ -1,23 +1,39 @@
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <queue>
-#include <fstream>
 #include <assert.h>
 #include <vector>
 #include <unordered_map>
 #include <functional>
 #include <boost/program_options.hpp>
 #include <exception>
+#include <algorithm>
 #include "cnpy.h"
+
+
+// #define DEBUG 1
+
+#ifdef DEBUG 
+#define D(x) x
+#else 
+#define D(x)
+#endif
 
 using namespace std;
 
-typedef unsigned long clock_time;
+// An assert macro that prints the values of both sides when assertion fails
+// https://stackoverflow.com/questions/2193544
+#define ASSERT(left,operator,right) { if(!((left) operator (right))){ std::cerr << "ASSERT FAILED: " << #left << #operator << #right << " @ " << __FILE__ << " (" << __LINE__ << "). " << #left << "=" << (left) << "; " << #right << "=" << (right) << std::endl; } }
+
+
+typedef float clock_time;
 
 class Query {
 private:
   clock_time source_time;
   clock_time sink_time;
+  bool sink_determined = false;
 public:
   const int id;
   Query(int id, clock_time src): id(id) {
@@ -25,8 +41,18 @@ public:
   };
   ~Query(){};
   void sink(clock_time snk){
+    D(printf("Sink called for %d\n", id);)
     sink_time = snk;
+    sink_determined = true;
   }
+  float end_to_end_time() {
+    if(!sink_determined) {
+      printf("Query id %d\n", id);
+      throw logic_error("Tried to get end to end time before sink was determined");
+    }
+    return sink_time - source_time;
+  }
+
 };
 
 class Node {
@@ -67,35 +93,8 @@ public:
 
 };
 
-// Forward declaration. The class can be found below the Scheduler class below.
-class SchedulableNode;
-
-typedef tuple<SchedulableNode*, clock_time, int> event;
-
-class Scheduler {
-private:
-  clock_time time_now;
-  // returns true if a is less than b. Because the priority queue
-  // takes items out by larger first, returning true means that
-  // a should be taken AFTER b
-  static bool compare(event a, event b) {
-    return get<1>(a) > get<1>(b);
-  }
-  priority_queue < event, vector<event> , function<bool(event,event)> > scheduled;
-public:
-  Scheduler(): scheduled(compare) {
-    time_now = 0;
-  };
-
-  void schedule(SchedulableNode* node, clock_time in_how_long, int identifier = 0) {
-    // event is not a function, it's a typedef of a tuple (see above)
-    event new_event (node, time_now + in_how_long, identifier);
-    scheduled.push(new_event);
-  }
-
-  // implemented after Node declaration in order to compile
-  void run();
-};
+// Forward declaration of Scheduler
+class Scheduler;
 
 class SchedulableNode : virtual public Node
 {
@@ -109,13 +108,40 @@ public:
   virtual void to_schedule(clock_time time_now, int identifier) = 0;
 };
 
-void Scheduler::run() {
-  while (!scheduled.empty()) {
-    event next_event = scheduled.top();
-    scheduled.pop();
-    get<0>(next_event) -> to_schedule(get<1>(next_event), get<2>(next_event));
+typedef tuple<SchedulableNode*, clock_time, int> event;
+
+class Scheduler {
+private:
+  clock_time time_now;
+  // returns true if a is less than b. Because the priority queue
+  // takes items out by larger first, returning true means that
+  // a should be taken AFTER b
+  static bool compare(event a, event b) {
+    return get<1>(a) > get<1>(b);
   }
-}
+  priority_queue < event, vector<event> , function<bool(event,event)> > scheduled;
+
+public:
+  Scheduler(): scheduled(compare) {
+    time_now = 0;
+  };
+
+  void schedule(SchedulableNode* node, clock_time in_how_long, int identifier = 0) {
+    // event is not a function, it's a typedef of a tuple (see above)
+    event new_event (node, time_now + in_how_long, identifier);
+    scheduled.push(new_event);
+  }
+
+  // implemented after Node declaration in order to compile
+  void run() {
+    while (!scheduled.empty()) {
+      event next_event = scheduled.top();
+      time_now = get<1>(next_event);
+      scheduled.pop();
+      get<0>(next_event) -> to_schedule(get<1>(next_event), get<2>(next_event));
+    }
+  }
+};
 
 class QueuedNode : virtual public Node
 {
@@ -144,12 +170,14 @@ private:
   void send_next(clock_time time_now) {
     if (next_query_index == deltas.second) {
       printf("Source node finished sending all the queries!\n");
+      return;
     }
-    query_array.push_back(Query(time_now, next_query_index));
+    D(printf("Sending %d\n", next_query_index);)
+    query_array.push_back(Query(next_query_index, time_now));
     Query* pointer = (query_array.data() + next_query_index);
     send(&pointer, 1, time_now);
+    scheduler -> schedule(this, deltas.first[next_query_index]);
     next_query_index++;
-    scheduler -> schedule(this, deltas.first[next_query_index-1]);
   }
 
 public:
@@ -157,7 +185,8 @@ public:
     SchedulableNode("source", scheduler), Node("source"), deltas(deltas) {
     next_query_index = 0;
     query_array.reserve(deltas.second);
-    printf("SourceNode %s constructor\n", name.c_str());
+    printf("SourceNode %s constructor with %d deltas\n", name.c_str(), deltas.second);
+    scheduler -> schedule(this, 0);
   };
   ~SourceNode() {
     delete deltas.first;
@@ -169,6 +198,15 @@ public:
 
   void arrival(Query** /*queries*/, int /*num_queries*/, clock_time /*time_now*/) override {
     throw logic_error("Arrival function called for source node");
+  }
+
+  // To be called only after scheduler completes
+  pair<float*, int> end_to_end_times() {
+    float* result = new float[query_array.size()];
+    for (unsigned int i = 0; i < query_array.size(); ++i) {
+      result[i] = query_array[i].end_to_end_time();
+    }
+    return pair<float*, int>(result, query_array.size());
   }
   
 };
@@ -189,9 +227,20 @@ private:
   void extract_batchsizes() {
     for (unsigned int i = 0; i < batchsize_p99lat_thru.size(); i+=3) {
       int value_from_array = (int)batchsize_p99lat_thru[i];
-      assert (value_from_array > 0);
+      ASSERT (value_from_array, >, 0);
       batchsizes.push_back((unsigned int)value_from_array);
     }
+  }
+
+  void print_behavior() {
+    printf("%s model behavior\n", name.c_str());
+    for (unsigned int i = 0; i < batchsize_p99lat_thru.size(); i+=3) {
+      int batchsize = (int) batchsize_p99lat_thru[i];
+      float p99_lat = batchsize_p99lat_thru[i+1];
+      float thru = batchsize_p99lat_thru[i+2];
+      printf("%d\t%f\t%f\n", batchsize, p99_lat, thru);
+    }
+    printf("\n");
   }
 
   // Given entry (the row in the original numpy array) return delay
@@ -234,22 +283,24 @@ private:
   // Replica takes from queue as much as it can. Must be called when there's something in queue
   // and replica is not processing something already
   void replica_take(int replica_index) {
-    assert (!arrival_queue.empty() && replica_queues[replica_index].empty());
+    assert (!arrival_queue.empty());
+    assert (replica_queues[replica_index].empty());
     int num_to_dequeue = min<int>(max_batchsize, arrival_queue.size());
     for (int j = 0; j < num_to_dequeue; j++) {
       Query* next_query = arrival_queue.front(); 
       replica_queues[replica_index].push_back(next_query);
+      D(printf("%s replica#%d take %d\n", name.c_str(), replica_index, next_query->id);)
       arrival_queue.pop();
     }
     scheduler -> schedule(this, latency_for_batchsize(num_to_dequeue), replica_index);
   }
   void finish_processing(int replica_index, clock_time time_now) {
-    vector<Query*> replica_queue = replica_queues[replica_index];
-    assert (replica_queue.size() > 0);
+    D(printf("%s finished processing\n", name.c_str());)
+    assert (replica_queues[replica_index].size() > 0);
     // Create an array pointer to the vector's contents
-    Query** array_pointer = &replica_queue[0];
-    send(array_pointer, replica_queue.size(), time_now);
-    replica_queue.clear();
+    Query** array_pointer = &replica_queues[replica_index][0];
+    send(array_pointer, replica_queues[replica_index].size(), time_now);
+    replica_queues[replica_index].clear();
     if (!arrival_queue.empty()) {
       replica_take(replica_index);
     }
@@ -264,6 +315,8 @@ protected:
         if (arrival_queue.empty()) {
           break;
         }
+      } else {
+        // printf("%s replica index %d has %d items\n", name.c_str(), i, (int)replica_queues[i].size());
       }
     }
   }
@@ -275,6 +328,7 @@ public:
   BatchedNode(string name, int max_batchsize, pair<float*, int> model_behavior, int num_replicas, Scheduler* scheduler)
     :QueuedNode(name), SchedulableNode(name, scheduler), Node(name), max_batchsize(max_batchsize),num_replicas(num_replicas),batchsize_p99lat_thru(model_behavior.first, model_behavior.first+model_behavior.second){
       extract_batchsizes();
+      print_behavior();
       for (int i = 0; i < num_replicas; ++i) {
         replica_queues.push_back(vector<Query*>());
       }
@@ -373,32 +427,32 @@ int main(int argc, char const *argv[])
   const size_t ERROR_UNHANDLED_EXCEPTION = 2; 
 
   string deltas_file = "default";
-  int irp = 0;
+  int irf = 0;
   int ibs = 0;
   string ibe = "default";
-  int rrp = 0;
+  int rrf = 0;
   int rbs = 0;
   string rbe = "default";
-  int lrp = 0;
+  int lrf = 0;
   int lbs = 0;
   string lbe = "default";
-  int krp = 0;
+  int krf = 0;
   int kbs = 0;
   string kbe = "default";
   po::options_description desc("C++ simulation");
   desc.add_options()
       ("help", "produce help message")
       ("deltas", po::value<string>(&deltas_file)->required(), "Deltas file with ms difference between queries")
-      ("irp", po::value<int>(&irp)->required(), "Inception replication factor")
+      ("irf", po::value<int>(&irf)->required(), "Inception replication factor")
       ("ibs", po::value<int>(&ibs)->required(), "Inception batchsize")
       ("ibe", po::value<string>(&ibe)->required(), "Inception behavior file")
-      ("rrp", po::value<int>(&rrp)->required(), "ResNet replication factor")
+      ("rrf", po::value<int>(&rrf)->required(), "ResNet replication factor")
       ("rbs", po::value<int>(&rbs)->required(), "ResNet batchsize")
       ("rbe", po::value<string>(&rbe)->required(), "ResNet behavior file")
-      ("lrp", po::value<int>(&lrp)->required(), "LogReg replication factor")
+      ("lrf", po::value<int>(&lrf)->required(), "LogReg replication factor")
       ("lbs", po::value<int>(&lbs)->required(), "LogReg batchsize")
       ("lbe", po::value<string>(&lbe)->required(), "LogReg behavior file")
-      ("krp", po::value<int>(&krp)->required(), "Inception replication factor")
+      ("krf", po::value<int>(&krf)->required(), "Inception replication factor")
       ("kbs", po::value<int>(&kbs)->required(), "Inception batchsize")
       ("kbe", po::value<string>(&kbe)->required(), "Inception behavior file")
   ;
@@ -434,10 +488,10 @@ int main(int argc, char const *argv[])
 
   Scheduler scheduler;
   SourceNode source (result, &scheduler);
-  BatchedNode inception ("Inception", ibs, extract_cnpy(inception_behavior), irp, &scheduler);
-  BatchedNode resnet ("ResNet", rbs, extract_cnpy(resnet_behavior), rrp, &scheduler);
-  BatchedNode logreg ("LogReg", lbs, extract_cnpy(logreg_behavior), lrp, &scheduler);
-  BatchedNode ksvm ("KSVM", kbs, extract_cnpy(ksvm_behavior), krp, &scheduler);
+  BatchedNode inception ("Inception", ibs, extract_cnpy(inception_behavior), irf, &scheduler);
+  BatchedNode resnet ("ResNet", rbs, extract_cnpy(resnet_behavior), rrf, &scheduler);
+  BatchedNode logreg ("LogReg", lbs, extract_cnpy(logreg_behavior), lrf, &scheduler);
+  BatchedNode ksvm ("KSVM", kbs, extract_cnpy(ksvm_behavior), krf, &scheduler);
   JoinNode join ("Join");
   SinkNode sink;
   source.then(&inception);
@@ -447,6 +501,17 @@ int main(int argc, char const *argv[])
   logreg.then(&join);
   ksvm.then(&join);
   join.then(&sink);
+
+  scheduler.run();
+
+  pair<float*, int> end_to_end_times = source.end_to_end_times();
+  ofstream myfile;
+  myfile.open ("end_to_end_times.txt", ofstream::out | ofstream::trunc);
+  for (int i = 0; i < end_to_end_times.second; ++i) {
+    myfile << to_string(end_to_end_times.first[i]);
+    myfile << "\n";
+  }
+  myfile.close();
 
   return 0;
 }
