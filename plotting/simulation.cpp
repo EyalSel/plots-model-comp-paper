@@ -14,7 +14,7 @@
 
 // #define DEBUG 1
 
-#ifdef DEBUG 
+#ifdef DEBUG
 #define D(x) x
 #else 
 #define D(x)
@@ -41,7 +41,7 @@ public:
   };
   ~Query(){};
   void sink(clock_time snk){
-    D(printf("Sink called for %d\n", id);)
+    D(printf("%f:\tSink called for %d\n", snk, id);)
     sink_time = snk;
     sink_determined = true;
   }
@@ -172,7 +172,7 @@ private:
       printf("Source node finished sending all the queries!\n");
       return;
     }
-    D(printf("Sending %d\n", next_query_index);)
+    D(printf("%f:\tSending %d\n", time_now, next_query_index);)
     query_array.push_back(Query(next_query_index, time_now));
     Query* pointer = (query_array.data() + next_query_index);
     send(&pointer, 1, time_now);
@@ -246,7 +246,7 @@ private:
   // Given entry (the row in the original numpy array) return delay
   // calculated from throughput (so mean, not p99)
   float get_delay_for_entry(int entry_id) {
-    return 1/batchsize_p99lat_thru[entry_id*3+2]*1000;
+    return 1/batchsize_p99lat_thru[entry_id*3+2]*1000*batchsize_p99lat_thru[entry_id*3];
   }
 
   // Given a batchsize, returns the predicted latency by connecting a line
@@ -282,36 +282,38 @@ private:
 
   // Replica takes from queue as much as it can. Must be called when there's something in queue
   // and replica is not processing something already
-  void replica_take(int replica_index) {
+  void replica_take(int replica_index, clock_time time_now) {
     assert (!arrival_queue.empty());
     assert (replica_queues[replica_index].empty());
     int num_to_dequeue = min<int>(max_batchsize, arrival_queue.size());
     for (int j = 0; j < num_to_dequeue; j++) {
       Query* next_query = arrival_queue.front(); 
       replica_queues[replica_index].push_back(next_query);
-      D(printf("%s replica#%d take %d\n", name.c_str(), replica_index, next_query->id);)
+      D(printf("%f:\t%s replica#%d take %d\n", time_now, name.c_str(), replica_index, next_query->id);)
       arrival_queue.pop();
     }
+    D(printf("%f:\t%s replica#%d a batch of %d\n", time_now, name.c_str(), replica_index, num_to_dequeue);)
     scheduler -> schedule(this, latency_for_batchsize(num_to_dequeue), replica_index);
   }
   void finish_processing(int replica_index, clock_time time_now) {
-    D(printf("%s finished processing\n", name.c_str());)
+    D(printf("%f:\t%s replica#%d finished processing\n", time_now, name.c_str(), replica_index);)
     assert (replica_queues[replica_index].size() > 0);
     // Create an array pointer to the vector's contents
     Query** array_pointer = &replica_queues[replica_index][0];
     send(array_pointer, replica_queues[replica_index].size(), time_now);
     replica_queues[replica_index].clear();
     if (!arrival_queue.empty()) {
-      replica_take(replica_index);
+      replica_take(replica_index, time_now);
     }
   }
 protected:
   void arrival(Query** queries, int num_queries, clock_time time_now) override {
     QueuedNode::arrival(queries, num_queries, time_now);
+    D(printf("%f:\t%s queue size: %lu\n", time_now, name.c_str(), arrival_queue.size()));
     assert (!arrival_queue.empty());
     for(int i = 0; i < num_replicas; i++) {
       if (replica_queues[i].empty()) {
-        replica_take(i);
+        replica_take(i, time_now);
         if (arrival_queue.empty()) {
           break;
         }
@@ -440,6 +442,7 @@ int main(int argc, char const *argv[])
   int kbs = 0;
   string kbe = "default";
   po::options_description desc("C++ simulation");
+  string result_file = "default";
   desc.add_options()
       ("help", "produce help message")
       ("deltas", po::value<string>(&deltas_file)->required(), "Deltas file with ms difference between queries")
@@ -455,6 +458,7 @@ int main(int argc, char const *argv[])
       ("krf", po::value<int>(&krf)->required(), "Inception replication factor")
       ("kbs", po::value<int>(&kbs)->required(), "Inception batchsize")
       ("kbe", po::value<string>(&kbe)->required(), "Inception behavior file")
+      ("result_file", po::value<string>(&result_file)->required(), "File name where to print end to end times")
   ;
   try { 
     
@@ -506,7 +510,7 @@ int main(int argc, char const *argv[])
 
   pair<float*, int> end_to_end_times = source.end_to_end_times();
   ofstream myfile;
-  myfile.open ("end_to_end_times.txt", ofstream::out | ofstream::trunc);
+  myfile.open (result_file, ofstream::out | ofstream::trunc);
   for (int i = 0; i < end_to_end_times.second; ++i) {
     myfile << to_string(end_to_end_times.first[i]);
     myfile << "\n";
