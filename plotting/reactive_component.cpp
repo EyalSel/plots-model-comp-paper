@@ -1,5 +1,8 @@
 #include <vector>
 #include <map>
+#include <thread>
+#include "ctpl.h"
+#include <future>
 
 // #define DEBUG 1
 
@@ -90,16 +93,24 @@ private:
       }
     }
     return most_seen_so_far;
-  }
+  } 
 
   // A thread-parallel version of the arrival_curve_y_value function
-  vector<pair<int,int> > arrival_curve_y_values(time_unit* x_values, int num_x_values, time_unit* interarrival_times, int number_of_interarrival_times) {
-
+  vector<pair<int,int> > arrival_curve_y_values(time_unit* x_values, int num_x_values, time_unit* timestamps, int num_timestamps) {
+    ctpl::thread_pool p(number_of_parallel_threads);
+    vector<future<int> > futures_vector;
+    for (int i = 0; i < num_x_values; ++i) {
+      // create threadpool, push arrival_curve_y_value with different x_value arguments, get futures back and place in vector
+      p.push(arrival_curve_y_value, x_values[i], timestamps, num_timstamps);
+    }
+    // loop through vector, call get to get the value of the future, return vector of x_values to y_values
   }
 
 public:
   const time_unit window_size;
-  ArrivalTracker(time_unit window_size):window_size(window_size){
+  const int number_of_parallel_threads;
+  ArrivalTracker(time_unit window_size, int number_of_parallel_threads):
+  window_size(window_size), number_of_parallel_threads(number_of_parallel_threads){
     window_start_index = 0;
     // pick x values for the arrival curve
   };
