@@ -282,7 +282,8 @@ private:
 
   // Replica takes from queue as much as it can. Must be called when there's something in queue
   // and replica is not processing something already
-  void replica_take(int replica_index, clock_time time_now) {
+  // time_now argument is wrapped with the debugging symbol because it's only used during debugging
+  void replica_take(int replica_index, clock_time D(time_now)) {
     assert (!arrival_queue.empty());
     assert (replica_queues[replica_index].empty());
     int num_to_dequeue = min<int>(max_batchsize, arrival_queue.size());
