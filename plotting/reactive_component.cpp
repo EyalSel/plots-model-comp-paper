@@ -3,8 +3,10 @@
 #include <thread>
 #include "ctpl.h"
 #include <future>
+#include <iostream>
+#include <fstream>
 
-// #define DEBUG 1
+#define DEBUG 1
 
 #ifdef DEBUG
 #define D(x) x
@@ -35,6 +37,7 @@ private:
   // The entire history of interarrival times recorded.
   vector<time_unit> all_interarrival_times;
   int window_start_index; // The index in the all_interarrival_times vector from which to the window begins
+  ctpl::thread_pool pool;
 
   // x-values of arrival curve coordinates need to spread out logarithmically
   // A sorted mapping from x-values to a pair that consists of:
@@ -47,7 +50,8 @@ private:
   // Returns the maximum number of queries that showed up in that interval
   // Notice that this function can be parallelized by cutting the timestamps in half, running this same function on both
   // halves separately, and then combining them by also finding the max of the intersection area
-  int arrival_curve_y_value(time_unit x_value, time_unit* timestamps, int num_timestamps) {
+  static int arrival_curve_y_value(int id, time_unit x_value, time_unit* timestamps, int num_timestamps) {
+    D(printf("Thread %d called arrival_curve_y_value for x_value %lu\n", id, x_value);)
     int tail_head = 0; // 0 means tail, 1 means head
     int head_index = 0; // the timestamp of index head_index is less than or equal to the sliding time-range's higher end
     int tail_index = 0; // the timestamp of index head_index is less than or equal to the sliding time-range's lower end
@@ -55,10 +59,13 @@ private:
     while (head_index < num_timestamps) {
       if (timestamps[tail_index] + x_value > timestamps[head_index]) {
         head_index++;
+      } else {
+        break;
       }
     }
     if (head_index == num_timestamps) {
       // x_value is bigger than the total span of the timestamps array
+      D(printf("Range of timestamps is smaller than the x_value!\n");)
       return num_timestamps;
     } else {
       // timestamps[head_index] - timestamps[tail_index] > x_value, so we take the head one index back to maintain invariant
@@ -66,6 +73,7 @@ private:
     }
     contained_currently = head_index - tail_index + 1;
     int most_seen_so_far = contained_currently;
+    D(printf("Before while loop\n");)
     while (head_index < num_timestamps - 1) {
       time_unit distance_to_next_tail = 0;
       time_unit distance_to_next_head = 0;
@@ -96,33 +104,83 @@ private:
   } 
 
   // A thread-parallel version of the arrival_curve_y_value function
-  vector<pair<int,int> > arrival_curve_y_values(time_unit* x_values, int num_x_values, time_unit* timestamps, int num_timestamps) {
-    ctpl::thread_pool p(number_of_parallel_threads);
-    vector<future<int> > futures_vector;
+  vector<pair<time_unit,int> > arrival_curve_y_values(time_unit* x_values, int num_x_values, time_unit* timestamps, int num_timestamps) {
+    D(printf("arrival_curve_y_values called with %d x_values\n", num_x_values);)
+    vector<pair<time_unit, future<int>> > futures_vector;
     for (int i = 0; i < num_x_values; ++i) {
       // create threadpool, push arrival_curve_y_value with different x_value arguments, get futures back and place in vector
-      p.push(arrival_curve_y_value, x_values[i], timestamps, num_timstamps);
+      D(printf("Pushing calculation for x_value %lu\n", x_values[i]);)
+      future<int> future_result = pool.push(arrival_curve_y_value, x_values[i], timestamps, num_timestamps);
+      futures_vector.push_back(make_pair(x_values[i], move(future_result)));
     }
     // loop through vector, call get to get the value of the future, return vector of x_values to y_values
+    vector<pair<time_unit, int> > result;
+    for (unsigned int i = 0; i < futures_vector.size(); ++i) {
+      result.push_back(make_pair(futures_vector[i].first, futures_vector[i].second.get()));
+    }
+    return result;
   }
 
 public:
   const time_unit window_size;
   const int number_of_parallel_threads;
   ArrivalTracker(time_unit window_size, int number_of_parallel_threads):
-  window_size(window_size), number_of_parallel_threads(number_of_parallel_threads){
+  window_size(window_size), number_of_parallel_threads(number_of_parallel_threads), pool(number_of_parallel_threads){
     window_start_index = 0;
     // pick x values for the arrival curve
   };
-  int add_timestamps(time_unit* timestamps, int num_timstamps) {
+  vector<pair<time_unit,int> > add_timestamps2(time_unit* timestamps, int num_timestamps) {
     // append to all_interarrival_times
     // figure out the maximum count (the y-value for each x-value) of the added piece = F
     // figure out the maximum count of the forefeited piece from the begining of the window = A
     // If F = max, need to rerun calculation on the entire new window span
     // if F < max and A > max, the arrival curve increased
     // if F < max and A <= max then nothing changed
+    vector<time_unit> x_values;
+    x_values.push_back(1000);
+    x_values.push_back(4000);
+    x_values.push_back(16000);
+    x_values.push_back(64000);
+    x_values.push_back(256000);
+    x_values.push_back(1024000);
+    return arrival_curve_y_values(x_values.data(), x_values.size(), timestamps, num_timestamps);
+  }
+
+  int add_timestamps(time_unit* timestamps, int num_timestamps) {
+    // append to all_interarrival_times
+    // figure out the maximum count (the y-value for each x-value) of the added piece = F
+    // figure out the maximum count of the forefeited piece from the begining of the window = A
+    // If F = max, need to rerun calculation on the entire new window span
+    // if F < max and A > max, the arrival curve increased
+    // if F < max and A <= max then nothing changed
+    return -2;
   }
 };
+
+pair<float*, int> read_deltas_file(string file_name){
+  // first count how many lines in file
+  ifstream myfile(file_name);
+  if(!myfile) {
+    printf("Error opening output file\n");
+    return pair<float*, int>(nullptr, 0);
+  }
+  string line;
+  int number_of_lines = 0;
+  while (getline(myfile, line)) {
+    ++number_of_lines;
+  }
+  printf("Number of lines is %d\n", number_of_lines);
+  // then allocate array
+  float* result = new float[number_of_lines];
+  // then read lines into array and convert to float
+  myfile.clear();
+  myfile.seekg(0, myfile.beg);
+  for(int i = 0; i < number_of_lines; i++) {
+    assert (getline(myfile, line));
+    result[i] = stof(line);
+  }
+  return pair<float*, int>(result, number_of_lines);
+}
 
 #include <chrono>
 
@@ -132,4 +190,16 @@ int main(int argc, char const *argv[])
 {
   int ms = duration_cast< microseconds >(system_clock::now().time_since_epoch()).count();
   printf("%d\n", ms);
+  pair<float*, int> deltas = read_deltas_file("/data/ges/plots-model-comp-paper/experiments/cached_arrival_processes/241_0.1.deltas");
+  vector<long> long_deltas (deltas.second);
+  float sum = 0;
+  for (int i = 0; i < deltas.second; ++i) {
+    sum+=deltas.first[i];
+    long_deltas[i] = long(sum*1000);
+  }
+  ArrivalTracker tracker (0, 4);
+  auto result = tracker.add_timestamps2(long_deltas.data(), long_deltas.size());
+  for(auto v:result) {
+    printf("%lu -> %d\n", v.first, v.second);
+  }
 }
