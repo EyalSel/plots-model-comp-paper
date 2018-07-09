@@ -35,23 +35,26 @@ class ArrivalTracker
 {
 private:
   // The entire history of interarrival times recorded.
-  vector<time_unit> all_interarrival_times;
-  int window_start_index; // The index in the all_interarrival_times vector from which to the window begins
+  vector<time_unit> all_timestamps;
   ctpl::thread_pool pool;
 
   // x-values of arrival curve coordinates need to spread out logarithmically
   // A sorted mapping from x-values to a pair that consists of:
   // 1. The corresponding y-value on the arrival curve
-  // 2. The start/end index of the window span with the highest value
-  // 3. The start/end index of the window span with the lowest value
-  map<time_unit, tuple<int, int, int> > queries_frequency;
+  // 2. The start index of the window span with the highest value
+  // 3. The start index of the window 
+  map<time_unit, tuple<int, int> > queries_frequency;
 
   // function that takes a time_unit x-value, and a time_unit* array of interarrival times.
   // Returns the maximum number of queries that showed up in that interval
   // Notice that this function can be parallelized by cutting the timestamps in half, running this same function on both
   // halves separately, and then combining them by also finding the max of the intersection area
-  static int arrival_curve_y_value(int id, time_unit x_value, time_unit* timestamps, int num_timestamps) {
+  static pair<int,int> arrival_curve_y_value(int id, time_unit x_value, time_unit* timestamps, int num_timestamps) {
     D(printf("Thread %d called arrival_curve_y_value for x_value %lu\n", id, x_value);)
+    if (num_timestamps == 0) {
+      D(printf("arrival_curve_y_value received a call with 0 timestamps!\n");)
+      return 0;
+    }
     int tail_head = 0; // 0 means tail, 1 means head
     int head_index = 0; // the timestamp of index head_index is less than or equal to the sliding time-range's higher end
     int tail_index = 0; // the timestamp of index head_index is less than or equal to the sliding time-range's lower end
@@ -72,6 +75,7 @@ private:
       head_index--;
     }
     contained_currently = head_index - tail_index + 1;
+    int index_of_biggest_window = 0;
     int most_seen_so_far = contained_currently;
     D(printf("Before while loop\n");)
     while (head_index < num_timestamps - 1) {
@@ -98,9 +102,10 @@ private:
       D(ASSERT(contained_currently, >=, head_index - tail_index))
       if (contained_currently > most_seen_so_far) {
         most_seen_so_far = contained_currently;
+        index_of_biggest_window = tail_index+1;
       }
     }
-    return most_seen_so_far;
+    return make_pair(most_seen_so_far,index_of_biggest_window);
   } 
 
   // A thread-parallel version of the arrival_curve_y_value function
@@ -126,11 +131,10 @@ public:
   const int number_of_parallel_threads;
   ArrivalTracker(time_unit window_size, int number_of_parallel_threads):
   window_size(window_size), number_of_parallel_threads(number_of_parallel_threads), pool(number_of_parallel_threads){
-    window_start_index = 0;
     // pick x values for the arrival curve
   };
   vector<pair<time_unit,int> > add_timestamps2(time_unit* timestamps, int num_timestamps) {
-    // append to all_interarrival_times
+    // append to all_timestamps
     // figure out the maximum count (the y-value for each x-value) of the added piece = F
     // figure out the maximum count of the forefeited piece from the begining of the window = A
     // If F = max, need to rerun calculation on the entire new window span
@@ -147,7 +151,21 @@ public:
   }
 
   int add_timestamps(time_unit* timestamps, int num_timestamps) {
-    // append to all_interarrival_times
+    // append to all_timestamps
+    all_timestamps.push_back(timestamps, timestamps+num_timestamps);
+    // figure out section that's forfeited
+    int tail_index = 0;
+    while (tail_index < all_timestamps.size()) {
+      if (all_timestamps[tail_index] + window_size < all_timestamps.end()[-1]) {
+        tail_index++;
+      } else {
+        break;
+      }
+    }
+    if (tail_index == 0) {
+
+    }
+
     // figure out the maximum count (the y-value for each x-value) of the added piece = F
     // figure out the maximum count of the forefeited piece from the begining of the window = A
     // If F = max, need to rerun calculation on the entire new window span
