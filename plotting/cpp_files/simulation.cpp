@@ -368,10 +368,10 @@ public:
   JoinNode(string name):QueuedNode(name), Node(name) {}
 };
 
-class SinkNode : public QueuedNode
+class SinkNode : public Node
 {
 public:
-  SinkNode(): QueuedNode("sink"), Node("sink"){}
+  SinkNode(): Node("sink"){}
 protected:
   void arrival(Query** queries, int num_queries, clock_time time_now) override {
     for (int i = 0; i < num_queries; ++i)
